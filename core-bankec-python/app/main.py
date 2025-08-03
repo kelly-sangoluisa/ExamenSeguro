@@ -743,9 +743,9 @@ class MyCards(Resource):
     def get(self):
         """
         Devuelve todas las tarjetas registradas por el usuario:
-        - Internas (`secure_cards`) con deuda
-        - Externas (`stored_cards`)
-        Todos los números están enmascarados.
+        - Tarjetas internas (`secure_cards`) con deuda asociada.
+        - Tarjetas externas (`stored_cards`) previamente guardadas.
+        Los números de tarjeta siempre se devuelven enmascarados.
         """
         user_id = g.user['id']
         conn = get_connection()
