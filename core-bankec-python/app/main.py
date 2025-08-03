@@ -533,16 +533,16 @@ class CreditPayment(Resource):
     def post(self):
         """
         Realiza una compra segura con tarjeta de crédito:
-        - Valida tarjeta (Luhn)
-        - Verifica OTP
-        - Cifra y guarda datos si no existen
-        - Verifica comercio registrado
-        - Registra compra
+        - Valida tarjeta (algoritmo Luhn)
+        - Verifica OTP (doble factor)
+        - Cifra datos de tarjeta y los guarda si no existen
+        - Verifica que el comercio esté registrado
+        - Descuenta saldo de cuenta y registra deuda en tarjeta
         """
         data = request.get_json()
         user_id = g.user['id']
 
-        # Validar campos requeridos
+        # Validar que todos los campos requeridos estén presentes
         campos = ['amount', 'card_number', 'cvv', 'expiry', 'otp', 'store_id']
         if not all(k in data for k in campos):
             return {"message": "Faltan campos requeridos"}, 400
@@ -551,15 +551,18 @@ class CreditPayment(Resource):
         if amount <= 0:
             return {"message": "Monto inválido"}, 400
 
+        # Normalización de datos de tarjeta y autenticación
         card_number = data['card_number'].replace(" ", "")
         cvv = data['cvv']
         expiry = data['expiry']
         otp = data['otp']
         store_id = data['store_id']
-
+        
+        # Validar tarjeta usando algoritmo Luhn
         if not validar_tarjeta_luhn(card_number):
             return {"message": "Número de tarjeta inválido"}, 400
-
+            
+        # Verificar OTP para doble factor de autenticación
         if not verificar_otp(user_id, otp):
             return {"message": "OTP inválido o expirado"}, 401
 
@@ -579,7 +582,7 @@ class CreditPayment(Resource):
             if not cuenta or float(cuenta[0]) < amount:
                 return {"message": "Fondos insuficientes"}, 400
 
-            # Verificar si tarjeta ya fue guardada
+            # Comprobar si la tarjeta ya fue guardada en formato cifrado
             tarjeta_cifrada = cifrar_dato(card_number)
             cur.execute("SELECT id FROM bank.secure_cards WHERE user_id = %s AND card_number = %s", (user_id, tarjeta_cifrada))
             tarjeta_existente = cur.fetchone()
@@ -596,7 +599,7 @@ class CreditPayment(Resource):
                     cifrar_dato(expiry)
                 ))
 
-            # Realizar transacción
+            # Ejecutar transacción: descontar saldo y registrar la deuda
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
 
