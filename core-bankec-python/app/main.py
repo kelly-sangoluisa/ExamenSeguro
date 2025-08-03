@@ -34,6 +34,13 @@ def hash_password(password):
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
+def check_password(plain_password, stored_password):
+    """Verifica contraseña hasheada o texto plano."""
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), stored_password.encode('utf-8'))
+    except:
+        return plain_password == stored_password
+
 def check_username_exists(username):
     """Verifica si el username ya existe."""
     conn = get_connection()
@@ -174,7 +181,7 @@ class Login(Resource):
         cur.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (username,))
         user = cur.fetchone()
         
-        if user and user[2] == password:
+        if user and check_password(password, user[2]):  # ← ÚNICO CAMBIO AQUÍ
             user_data = {
                 'id': user[0],
                 'username': user[1],
