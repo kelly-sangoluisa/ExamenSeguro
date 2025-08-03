@@ -1,14 +1,21 @@
 import secrets
 import os
-from flask import Flask, request, g
-from flask_restx import Api, Resource, fields # type: ignore
-from functools import wraps
-from dotenv import load_dotenv
-from .db import get_connection, init_db
-from .jwt_auth import create_jwt_manager, jwt_required
-from .validators import validate_cedula, validate_phone, validate_username, validate_password
 import logging
 import bcrypt
+
+from flask import Flask, request, g
+from flask_restx import Api, Resource, fields  # type: ignore
+from functools import wraps
+from dotenv import load_dotenv
+
+from .db import get_connection, init_db
+from .jwt_auth import create_jwt_manager, jwt_required
+from .validators import (
+    validate_cedula, validate_phone, validate_username,
+    validate_password, validar_tarjeta_luhn
+)
+from app.utils.otp_manager import verificar_otp
+from app.secure_storage import cifrar_dato, descifrar_dato
 
 # Define a simple in-memory token store
 tokens = {}
@@ -501,10 +508,6 @@ class Transfer(Resource):
         conn.close()
         return {"message": "Transfer successful", "new_balance": new_balance}, 200
 
-from app.utils.otp_manager import verificar_otp
-from app.secure_storage import cifrar_dato
-from app.validators import validar_tarjeta_luhn
-
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
     @bank_ns.doc('credit_payment_secure')
@@ -596,58 +599,180 @@ class CreditPayment(Resource):
 
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):
-    @bank_ns.expect(pay_credit_balance_model, validate=True)
-    @bank_ns.doc('pay_credit_balance')
+    @bank_ns.expect(bank_ns.model('SecurePayCreditBalance', {
+        'amount': fields.Float(required=True, description='Monto a pagar'),
+        'first6': fields.String(required=True, description='Primeros 6 dígitos de la tarjeta'),
+        'otp': fields.String(required=True, description='Código OTP'),
+        'card_number': fields.String(required=True, description='Número completo de tarjeta'),
+        'cvv': fields.String(required=True, description='CVV'),
+        'expiry': fields.String(required=True, description='Fecha de expiración MM/YY'),
+    }), validate=True)
+    @bank_ns.doc('secure_pay_credit_balance')
     @jwt_required
     def post(self):
         """
-        Realiza un abono a la deuda de la tarjeta:
-        - Descuenta el monto (o el máximo posible) de la cuenta.
-        - Reduce la deuda de la tarjeta de crédito.
+        Realiza un abono a la deuda de la tarjeta (cumple TCE-05):
+        - Solicita primeros 6 dígitos de tarjeta para validación.
+        - Permite pagar con tarjetas internas o registrar externas.
+        - Verifica OTP.
+        - Cifra los datos sensibles.
         """
         data = api.payload
-        amount = data.get("amount", 0)
+        user_id = g.user['id']
+        amount = float(data.get("amount", 0))
+        otp = data.get("otp")
+        first6 = data.get("first6")
+        full_card = data.get("card_number").replace(" ", "")
+        cvv = data.get("cvv")
+        expiry = data.get("expiry")
+
         if amount <= 0:
             api.abort(400, "Amount must be greater than zero")
+
+        if not validar_tarjeta_luhn(full_card):
+            api.abort(400, "Número de tarjeta inválido")
+
+        if not full_card.startswith(first6):
+            api.abort(400, "Los primeros 6 dígitos no coinciden con la tarjeta")
+
+        if not verificar_otp(user_id, otp):
+            api.abort(401, "OTP inválido o expirado")
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        try:
+            # Verificar si la tarjeta ya está registrada en secure_cards
+            tarjeta_cifrada = cifrar_dato(full_card)
+            cur.execute("""
+                SELECT id FROM bank.secure_cards
+                WHERE user_id = %s AND card_number = %s
+            """, (user_id, tarjeta_cifrada))
+            es_tarjeta_interna = cur.fetchone() is not None
+
+            # Obtener fondos del usuario
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            cuenta = cur.fetchone()
+            if not cuenta or float(cuenta[0]) < amount:
+                return {"message": "Fondos insuficientes"}, 400
+            account_balance = float(cuenta[0])
+
+            # Obtener deuda de la tarjeta
+            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
+            deuda = cur.fetchone()
+            if not deuda:
+                return {"message": "No se encontró tarjeta de crédito"}, 404
+            credit_debt = float(deuda[0])
+
+            payment = min(amount, credit_debt)
+
+            # Descontar del saldo de cuenta
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+            cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+
+            # Si es tarjeta externa y no existe, guardar en stored_cards
+            if not es_tarjeta_interna:
+                masked_card = f"{full_card[:6]}******{full_card[-4:]}"
+                cur.execute("""
+                    SELECT id FROM bank.stored_cards 
+                    WHERE user_id = %s AND encrypted_card_number = %s
+                """, (user_id, tarjeta_cifrada))
+                existente = cur.fetchone()
+
+                if not existente:
+                    cur.execute("""
+                        INSERT INTO bank.stored_cards (
+                            user_id, masked_card, encrypted_card_number,
+                            encrypted_expiry, encrypted_cvv
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        user_id,
+                        masked_card,
+                        tarjeta_cifrada,
+                        cifrar_dato(expiry),
+                        cifrar_dato(cvv)
+                    ))
+
+            # Confirmar transacción
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            nuevo_saldo = float(cur.fetchone()[0])
+            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
+            nueva_deuda = float(cur.fetchone()[0])
+
+            conn.commit()
+            return {
+                "message": "Pago exitoso de deuda con tarjeta",
+                "account_balance": nuevo_saldo,
+                "credit_card_debt": nueva_deuda
+            }, 200
+
+        except Exception as e:
+            conn.rollback()
+            return {"message": f"Error durante la operación: {str(e)}"}, 500
+
+        finally:
+            cur.close()
+            conn.close()
+
+@bank_ns.route('/my-cards')
+class MyCards(Resource):
+    @bank_ns.doc('get_user_cards')
+    @jwt_required
+    def get(self):
+        """
+        Devuelve todas las tarjetas registradas por el usuario:
+        - Internas (`secure_cards`) con deuda
+        - Externas (`stored_cards`)
+        Todos los números están enmascarados.
+        """
         user_id = g.user['id']
         conn = get_connection()
         cur = conn.cursor()
-        # Check account funds
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
+
+        tarjetas = []
+
+        try:
+            # Tarjetas internas (secure_cards)
+            cur.execute("""
+                SELECT card_number, expiry, balance 
+                FROM bank.secure_cards sc
+                JOIN bank.credit_cards cc ON sc.user_id = cc.user_id
+                WHERE sc.user_id = %s
+            """, (user_id,))
+            for row in cur.fetchall():
+                card = descifrar_dato(row[0])
+                masked = f"{card[:6]}******{card[-4:]}"
+                tarjetas.append({
+                    "type": "secure",
+                    "card": masked,
+                    "expiry": descifrar_dato(row[1]),
+                    "debt": float(row[2])
+                })
+
+            # Tarjetas externas (stored_cards)
+            cur.execute("""
+                SELECT masked_card, encrypted_expiry 
+                FROM bank.stored_cards 
+                WHERE user_id = %s
+            """, (user_id,))
+            for row in cur.fetchall():
+                tarjetas.append({
+                    "type": "stored",
+                    "card": row[0],
+                    "expiry": descifrar_dato(row[1]),
+                    "debt": None
+                })
+
+            return {"cards": tarjetas}, 200
+
+        except Exception as e:
+            conn.rollback()
+            return {"message": f"Error obteniendo tarjetas: {str(e)}"}, 500
+
+        finally:
             cur.close()
             conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
-        # Get current credit card debt
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Credit card not found")
-        credit_debt = float(row[0])
-        payment = min(amount, credit_debt)
-        
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-        cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        new_account_balance = float(cur.fetchone()[0])
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        new_credit_debt = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {
-            "message": "Credit card debt payment successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_debt
-        }, 200
 
 # CORREGIDO: Usar el nuevo decorador para Flask 2.0+
 @app.before_request

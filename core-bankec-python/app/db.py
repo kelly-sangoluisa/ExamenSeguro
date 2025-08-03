@@ -105,6 +105,19 @@ def init_db():
     );
     """)
 
+    # Crear tabla para registrar tarjetas externas seguras
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.stored_cards (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES bank.users(id),
+        masked_card TEXT NOT NULL,
+        encrypted_card_number TEXT NOT NULL,
+        encrypted_expiry TEXT NOT NULL,
+        encrypted_cvv TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
     # Insertar datos de ejemplo si no existen usuarios
     cur.execute("SELECT COUNT(*) FROM bank.users;")
     count = cur.fetchone()[0]

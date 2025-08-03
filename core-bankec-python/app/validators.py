@@ -88,3 +88,20 @@ def validate_password(password, personal_info):
             return False, "Password cannot contain personal information"
     
     return True, "Valid password"
+
+def validar_tarjeta_luhn(numero_tarjeta):
+    """Valida un número de tarjeta con el algoritmo de Luhn."""
+    numero_tarjeta = numero_tarjeta.replace(" ", "")
+    if not numero_tarjeta.isdigit():
+        return False
+
+    suma = 0
+    invertir = numero_tarjeta[::-1]
+    for i, digito in enumerate(invertir):
+        n = int(digito)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        suma += n
+    return suma % 10 == 0
