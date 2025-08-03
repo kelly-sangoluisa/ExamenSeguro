@@ -77,6 +77,16 @@ class LoggingMiddleware:
                     'ruta': request.path
                 }
             
+            # Lista de endpoints que ya tienen logging específico (evitar duplicación)
+            endpoints_con_logging_especifico = [
+                '/auth/login',
+                '/auth/logout'
+            ]
+            
+            # No registrar en middleware si el endpoint ya tiene logging específico
+            if log_info['ruta'] in endpoints_con_logging_especifico:
+                return response
+            
             # Construir descripción de la acción
             accion = self.construir_descripcion_accion(log_info, response.status_code)
             
@@ -106,44 +116,34 @@ class LoggingMiddleware:
         Returns:
             str: Dirección IP del cliente
         """
-        # 1. Intentar obtener IP real desde headers de proxy (más común en producción)
         forwarded_for = request.headers.get('X-Forwarded-For')
         if forwarded_for:
-            # X-Forwarded-For puede contener múltiples IPs separadas por comas
-            # La primera es la IP original del cliente
             ip_cliente = forwarded_for.split(',')[0].strip()
-            # Validar que no sea una IP privada de Docker
             if not ip_cliente.startswith(('172.', '10.', '192.168.')):
                 return ip_cliente
         
-        # 2. Intentar otros headers comunes de proxy
         real_ip = request.headers.get('X-Real-IP')
         if real_ip and not real_ip.startswith(('172.', '10.', '192.168.')):
             return real_ip.strip()
         
-        # 3. Para desarrollo local con Docker, intentar obtener la IP del host
         remote_addr = request.remote_addr or 'unknown'
         
-        # Si es una IP de Docker (172.x.x.x), intentar obtener la IP real
         if remote_addr.startswith('172.'):
-            # En desarrollo local con Docker, podemos usar la IP del gateway
             forwarded_host = request.headers.get('X-Forwarded-Host')
             if forwarded_host:
                 return forwarded_host
             
-            # Intentar detectar si viene de localhost
             host_header = request.headers.get('Host', '')
             if 'localhost' in host_header or '127.0.0.1' in host_header:
-                return '127.0.0.1'  # IP local de desarrollo
+                return '127.0.0.1'
             
-            # Si no podemos determinar la IP real, usar la que tenemos
             return remote_addr
         
         return remote_addr
     
     def obtener_usuario(self) -> str:
         """
-        Obtiene el nombre del usuario autenticado.
+        Obtiene el nombre del usuario autenticado desde la base de datos.
         
         Returns:
             str: Nombre de usuario o 'anon' si no está autenticado
@@ -157,59 +157,87 @@ class LoggingMiddleware:
             # Verificar si hay token en el header Authorization
             auth_header = request.headers.get('Authorization', '')
             if auth_header.startswith('Bearer '):
-                # Si hay token pero no hay usuario en g, significa que el token es inválido
-                return 'token_invalido'
+                token = auth_header.split(' ')[1]
+                username = self.obtener_usuario_desde_token(token)
+                if username:
+                    return username
+                else:
+                    return 'token_invalido'
             
             return 'anon'
             
         except Exception:
             return 'anon'
     
+    def obtener_usuario_desde_token(self, token: str) -> str:
+        """
+        Obtiene el usuario desde la base de datos usando el JWT token.
+        
+        Args:
+            token (str): Token JWT
+            
+        Returns:
+            str: Username del usuario o None si el token es inválido
+        """
+        try:
+            import jwt
+            import os
+            from ..db import get_connection
+            
+            secret_key = os.getenv('JWT_SECRET_KEY', 'dev-secret-key')
+            payload = jwt.decode(token, secret_key, algorithms=['HS256'])
+            user_id = payload.get('user_id')
+            
+            if not user_id:
+                return None
+            
+            conn = get_connection()
+            if not conn:
+                return None
+                
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT username 
+                FROM bank.users 
+                WHERE id = %s
+            """, (user_id,))
+            
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if result:
+                return result[0]
+            
+            return None
+            
+        except Exception:
+            return None
+    
     def construir_descripcion_accion(self, log_info: dict, status_code: int) -> str:
         """
         Construye una descripción detallada de la acción realizada.
-        
-        Args:
-            log_info (dict): Información de la petición
-            status_code (int): Código de respuesta HTTP
-            
-        Returns:
-            str: Descripción de la acción
         """
         metodo = log_info.get('metodo', 'UNKNOWN')
         ruta = log_info.get('ruta', '/unknown')
-        query_params = log_info.get('query_params', {})
         
-        # Construir descripción base
         descripcion = f"{metodo} {ruta}"
         
-        # Agregar parámetros de consulta si existen (sin valores sensibles)
-        if query_params:
-            params_seguros = {k: '***' if self.es_parametro_sensible(k) else v 
-                             for k, v in query_params.items()}
-            if params_seguros:
-                params_str = '&'.join([f"{k}={v}" for k, v in params_seguros.items()])
-                descripcion += f"?{params_str}"
-        
-        # Agregar información del cuerpo de la petición para POST/PUT
         if metodo in ['POST', 'PUT', 'PATCH']:
             try:
                 if request.is_json:
-                    # Para requests JSON, registrar las claves sin valores sensibles
                     data = request.get_json(silent=True)
                     if isinstance(data, dict):
                         keys = [k if not self.es_parametro_sensible(k) else f"{k}:***" 
                                for k in data.keys()]
                         descripcion += f" | datos: {{{', '.join(keys)}}}"
                 elif request.form:
-                    # Para datos de formulario
                     keys = [k if not self.es_parametro_sensible(k) else f"{k}:***" 
                            for k in request.form.keys()]
                     descripcion += f" | form: {{{', '.join(keys)}}}"
             except Exception:
                 descripcion += " | datos: [no_parseables]"
         
-        # Agregar información del código de respuesta
         status_text = self.obtener_texto_status(status_code)
         descripcion += f" | respuesta: {status_code} {status_text}"
         
@@ -218,12 +246,6 @@ class LoggingMiddleware:
     def es_parametro_sensible(self, nombre_param: str) -> bool:
         """
         Determina si un parámetro contiene información sensible.
-        
-        Args:
-            nombre_param (str): Nombre del parámetro
-            
-        Returns:
-            bool: True si el parámetro es sensible
         """
         parametros_sensibles = [
             'password', 'pass', 'pwd', 'token', 'secret', 'key', 'auth',
@@ -262,12 +284,6 @@ class LoggingMiddleware:
     def obtener_texto_status(self, status_code: int) -> str:
         """
         Obtiene el texto descriptivo del código de estado HTTP.
-        
-        Args:
-            status_code (int): Código de estado HTTP
-            
-        Returns:
-            str: Texto descriptivo del código
         """
         status_texts = {
             200: 'OK', 201: 'Created', 204: 'No Content',

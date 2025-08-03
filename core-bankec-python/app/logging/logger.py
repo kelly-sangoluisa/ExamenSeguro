@@ -25,36 +25,27 @@ DB_PASSWORD = os.environ.get('POSTGRES_PASSWORD', 'postgres')
 def obtener_hora_local() -> str:
     """
     Obtiene la hora local sin usar librerías externas.
-    Implementa varios métodos de respaldo para diferentes entornos.
     
     Returns:
-        str: Fecha y hora en formato YYYY-MM-DD HH:MM:SS.ssss
+        str: Fecha y hora en formato YYYY-MM-DD HH:MM:SS.ssssss
     """
     try:
-        # Método 1: datetime.now() - debería dar hora local del sistema
         hora_local = datetime.now()
-        
-        # Verificar si estamos en Docker y la hora parece UTC
-        # (heurística: si la diferencia con UTC es 0, probablemente estamos en UTC)
         hora_utc = datetime.utcnow()
         diferencia = abs((hora_local - hora_utc).total_seconds())
         
-        # Si la diferencia es menor a 60 segundos, probablemente estamos en UTC
+        # Si estamos en Docker (UTC), ajustar para Ecuador (UTC-5)
         if diferencia < 60:
-            # Método 2: Ajustar manualmente para Ecuador (UTC-5)
-            # Puedes cambiar las horas según tu zona horaria
             hora_local = hora_utc - timedelta(hours=5)
             
-        return hora_local.strftime('%Y-%m-%d %H:%M:%S.%f')[:-2]
+        return hora_local.strftime('%Y-%m-%d %H:%M:%S.%f')
         
     except Exception:
-        # Método de respaldo: usar UTC si todo falla
-        return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-2]
+        return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
 
 def obtener_conexion_logs():
     """
     Obtiene una conexión a PostgreSQL para el sistema de logs.
-    Reutiliza la configuración de variables de entorno del sistema principal.
     
     Returns:
         psycopg2.connection: Conexión a la base de datos
@@ -68,8 +59,7 @@ def obtener_conexion_logs():
             password=DB_PASSWORD
         )
         return conn
-    except psycopg2.Error as e:
-        print(f"Error conectando a la base de datos para logs: {e}")
+    except psycopg2.Error:
         return None
 
 def inicializar_tabla_logs():
@@ -84,9 +74,9 @@ def inicializar_tabla_logs():
     try:
         cur = conn.cursor()
         
-        # Crear la tabla de logs del sistema
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS logs_sistema (
+            CREATE SCHEMA IF NOT EXISTS bank;
+            CREATE TABLE IF NOT EXISTS bank.logs_sistema (
                 id_log SERIAL PRIMARY KEY,
                 fecha_hora TIMESTAMP NOT NULL,
                 tipo_log VARCHAR(10) NOT NULL,
@@ -98,22 +88,20 @@ def inicializar_tabla_logs():
             );
         """)
         
-        # Crear índices para mejorar rendimiento
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_fecha_hora ON logs_sistema(fecha_hora);
+            CREATE INDEX IF NOT EXISTS idx_logs_fecha_hora ON bank.logs_sistema(fecha_hora);
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_tipo ON logs_sistema(tipo_log);
+            CREATE INDEX IF NOT EXISTS idx_logs_tipo ON bank.logs_sistema(tipo_log);
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_usuario ON logs_sistema(usuario);
+            CREATE INDEX IF NOT EXISTS idx_logs_usuario ON bank.logs_sistema(usuario);
         """)
         
         conn.commit()
         cur.close()
         
-    except psycopg2.Error as e:
-        print(f"Error inicializando tabla de logs: {e}")
+    except psycopg2.Error:
         conn.rollback()
     finally:
         conn.close()
@@ -132,10 +120,8 @@ def registrar_evento(tipo_log: str, ip_remota: str, usuario: str, accion: str, c
     Returns:
         bool: True si el registro fue exitoso, False en caso contrario
     """
-    
     # Validación de parámetros de entrada
     if not isinstance(tipo_log, str) or tipo_log not in ['INFO', 'DEBUG', 'WARNING', 'ERROR']:
-        print(f"Tipo de log inválido: {tipo_log}")
         return False
     
     if not isinstance(ip_remota, str) or len(ip_remota.strip()) == 0:
@@ -148,10 +134,9 @@ def registrar_evento(tipo_log: str, ip_remota: str, usuario: str, accion: str, c
         accion = "accion_no_especificada"
     
     if not isinstance(codigo_http, int) or codigo_http < 100 or codigo_http > 599:
-        print(f"Código HTTP inválido: {codigo_http}")
         return False
     
-    # Obtener fecha y hora local sin usar librerías externas
+    # Obtener fecha y hora local
     fecha_hora = obtener_hora_local()
     
     # Enmascarar información sensible en la acción
@@ -160,29 +145,25 @@ def registrar_evento(tipo_log: str, ip_remota: str, usuario: str, accion: str, c
     # Truncar campos que podrían ser muy largos
     ip_remota = ip_remota[:45]
     usuario = usuario[:100]
-    accion_enmascarada = accion_enmascarada[:1000]  # Limitar a 1000 caracteres
+    accion_enmascarada = accion_enmascarada[:1000]
     
     conn = obtener_conexion_logs()
     if not conn:
-        print("No se pudo conectar a la base de datos para registrar el log")
         return False
     
     try:
         cur = conn.cursor()
         
-        # Insertar el registro de log
         cur.execute("""
-            INSERT INTO logs_sistema (fecha_hora, tipo_log, ip_remota, usuario, accion, codigo_http)
+            INSERT INTO bank.logs_sistema (fecha_hora, tipo_log, ip_remota, usuario, accion, codigo_http)
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (fecha_hora, tipo_log, ip_remota, usuario, accion_enmascarada, codigo_http))
         
         conn.commit()
         cur.close()
-        
         return True
         
-    except psycopg2.Error as e:
-        print(f"Error registrando evento en logs: {e}")
+    except psycopg2.Error:
         conn.rollback()
         return False
     finally:
