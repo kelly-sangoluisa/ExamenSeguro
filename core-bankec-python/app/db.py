@@ -23,20 +23,35 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
     
-    # Crear la tabla de usuarios
-    cur.execute("""
-    CREATE SCHEMA IF NOT EXISTS bank AUTHORIZATION postgres;
+    # Crear schema
+    cur.execute("CREATE SCHEMA IF NOT EXISTS bank AUTHORIZATION postgres;")
     
+    # Crear la tabla de clientes PRIMERO (información personal separada)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.clients (
+        id SERIAL PRIMARY KEY,
+        nombres VARCHAR(100) NOT NULL,
+        apellidos VARCHAR(100) NOT NULL,
+        direccion TEXT NOT NULL,
+        cedula VARCHAR(10) UNIQUE NOT NULL,
+        celular VARCHAR(15) NOT NULL,
+        ip_registro INET,
+        fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    
+    # Crear la tabla de usuarios CON client_id como foreign key
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS bank.users (
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT NOT NULL,
         full_name TEXT,
-        email TEXT
-    ); commit;
+        email TEXT,
+        client_id INTEGER REFERENCES bank.clients(id)
+    );
     """)
-    conn.commit()
     
     # Crear la tabla de cuentas
     cur.execute("""
@@ -44,27 +59,26 @@ def init_db():
         id SERIAL PRIMARY KEY,
         balance NUMERIC NOT NULL DEFAULT 0,
         user_id INTEGER REFERENCES bank.users(id)
-    ); commit;
+    );
     """)
-    conn.commit()
     
     # Crear la tabla de tarjetas de crédito
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank.credit_cards (
         id SERIAL PRIMARY KEY,
-        limit_credit NUMERIC NOT NULL DEFAULT 1,
+        limit_credit NUMERIC NOT NULL DEFAULT 1000,
         balance NUMERIC NOT NULL DEFAULT 0,
         user_id INTEGER REFERENCES bank.users(id)
-    ); commit;
+    );
     """)
     
-    # Create tokens table to persist authentication tokens
+    # Crear tabla de tokens para autenticación
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank.tokens (
         token TEXT PRIMARY KEY,
         user_id INTEGER REFERENCES bank.users(id),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ); commit;
+    );
     """)
     
     conn.commit()
@@ -87,12 +101,12 @@ def init_db():
             # Crear una cuenta con saldo inicial 1000
             cur.execute("""
                 INSERT INTO bank.accounts (balance, user_id)
-                VALUES (%s, %s); commit;
+                VALUES (%s, %s);
             """, (1000, user_id))
             # Crear una tarjeta de crédito con límite 5000 y deuda 0
             cur.execute("""
                 INSERT INTO bank.credit_cards (limit_credit, balance, user_id)
-                VALUES (%s, %s, %s); commit;
+                VALUES (%s, %s, %s);
             """, (5000, 0, user_id))
         conn.commit()
     cur.close()
