@@ -22,7 +22,14 @@ tokens = {}
 
 # Funciones auxiliares para registro
 def get_client_ip(request):
-    """Obtiene la IP real del cliente."""
+    """
+    Obtiene la dirección IP real del cliente que hace la solicitud HTTP.
+    Prioriza el uso de la cabecera 'X-Forwarded-For' (si existe), utilizada
+    comúnmente por balanceadores de carga o proxies inversos.
+
+    Retorna:
+        str: Dirección IP detectada del cliente.
+    """
     ip_remota = request.headers.get('X-Forwarded-For')
     if ip_remota:
         ip_remota = ip_remota.split(',')[0].strip()
@@ -37,7 +44,18 @@ def get_client_ip(request):
     return ip_remota
 
 def hash_password(password):
-    """Hashea la contraseña usando bcrypt."""
+    """
+    Genera un hash seguro para una contraseña usando bcrypt.
+
+    Args:
+        password (str): Contraseña en texto plano.
+    Returns:
+        str: Contraseña hasheada lista para almacenar en la base de datos.
+
+    Seguridad:
+    - Bcrypt agrega automáticamente un 'salt' único a cada hash.
+    - Protege contra ataques de fuerza bruta y rainbow tables.
+    """
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
