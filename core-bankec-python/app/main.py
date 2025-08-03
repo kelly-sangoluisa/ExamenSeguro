@@ -501,50 +501,98 @@ class Transfer(Resource):
         conn.close()
         return {"message": "Transfer successful", "new_balance": new_balance}, 200
 
+from app.utils.otp_manager import verificar_otp
+from app.secure_storage import cifrar_dato
+from app.validators import validar_tarjeta_luhn
+
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
-    @bank_ns.expect(credit_payment_model, validate=True)
-    @bank_ns.doc('credit_payment')
+    @bank_ns.doc('credit_payment_secure')
     @jwt_required
     def post(self):
         """
-        Realiza una compra a crédito:
-        - Descuenta el monto de la cuenta.
-        - Aumenta la deuda de la tarjeta de crédito.
+        Realiza una compra segura con tarjeta de crédito:
+        - Valida tarjeta (Luhn)
+        - Verifica OTP
+        - Cifra y guarda datos si no existen
+        - Verifica comercio registrado
+        - Registra compra
         """
-        data = api.payload
-        amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
+        data = request.get_json()
         user_id = g.user['id']
+
+        # Validar campos requeridos
+        campos = ['amount', 'card_number', 'cvv', 'expiry', 'otp', 'store_id']
+        if not all(k in data for k in campos):
+            return {"message": "Faltan campos requeridos"}, 400
+
+        amount = float(data['amount'])
+        if amount <= 0:
+            return {"message": "Monto inválido"}, 400
+
+        card_number = data['card_number'].replace(" ", "")
+        cvv = data['cvv']
+        expiry = data['expiry']
+        otp = data['otp']
+        store_id = data['store_id']
+
+        if not validar_tarjeta_luhn(card_number):
+            return {"message": "Número de tarjeta inválido"}, 400
+
+        if not verificar_otp(user_id, otp):
+            return {"message": "OTP inválido o expirado"}, 401
+
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
+
+        try:
+            # Verificar que el comercio esté registrado
+            cur.execute("SELECT id FROM bank.establishments WHERE id = %s AND estado = TRUE", (store_id,))
+            comercio = cur.fetchone()
+            if not comercio:
+                return {"message": "Establecimiento no registrado"}, 400
+
+            # Verificar fondos del usuario
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            cuenta = cur.fetchone()
+            if not cuenta or float(cuenta[0]) < amount:
+                return {"message": "Fondos insuficientes"}, 400
+
+            # Verificar si tarjeta ya fue guardada
+            tarjeta_cifrada = cifrar_dato(card_number)
+            cur.execute("SELECT id FROM bank.secure_cards WHERE user_id = %s AND card_number = %s", (user_id, tarjeta_cifrada))
+            tarjeta_existente = cur.fetchone()
+
+            if not tarjeta_existente:
+                # Guardar tarjeta cifrada
+                cur.execute("""
+                    INSERT INTO bank.secure_cards (user_id, card_number, cvv, expiry)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    user_id,
+                    tarjeta_cifrada,
+                    cifrar_dato(cvv),
+                    cifrar_dato(expiry)
+                ))
+
+            # Realizar transacción
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
+            cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+
+            conn.commit()
+
+            return {
+                "message": "Compra a crédito exitosa",
+                "store_id": store_id,
+                "amount": amount
+            }, 200
+
+        except Exception as e:
+            conn.rollback()
+            return {"message": f"Error en la operación: {str(e)}"}, 500
+        finally:
             cur.close()
             conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
-        
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
-        cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        new_account_balance = float(cur.fetchone()[0])
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        new_credit_balance = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {
-            "message": "Credit card purchase successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_balance
-        }, 200
 
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):

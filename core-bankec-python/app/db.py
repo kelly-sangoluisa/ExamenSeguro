@@ -80,9 +80,31 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    
-    conn.commit()
-    
+
+    # Crear tabla segura para almacenar tarjetas cifradas
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.secure_cards (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES bank.users(id),
+        card_number TEXT NOT NULL,
+        cvv TEXT NOT NULL,
+        expiry TEXT NOT NULL,
+        encrypted BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # Crear tabla de establecimientos registrados
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.establishments (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        codigo TEXT UNIQUE NOT NULL,
+        estado BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
     # Insertar datos de ejemplo si no existen usuarios
     cur.execute("SELECT COUNT(*) FROM bank.users;")
     count = cur.fetchone()[0]
@@ -108,6 +130,7 @@ def init_db():
                 INSERT INTO bank.credit_cards (limit_credit, balance, user_id)
                 VALUES (%s, %s, %s);
             """, (5000, 0, user_id))
-        conn.commit()
+    
+    conn.commit()
     cur.close()
     conn.close()

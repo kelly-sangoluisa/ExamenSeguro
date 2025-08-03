@@ -118,3 +118,28 @@ def sanitizar_entrada(valor: Any) -> str:
     
     # Limitar longitud
     return valor_str[:500]  # Máximo 500 caracteres
+
+def validar_tarjeta_luhn(numero_tarjeta: str) -> bool:
+    """
+    Valida un número de tarjeta usando el algoritmo de Luhn.
+
+    Args:
+        numero_tarjeta (str): Número de tarjeta a validar.
+
+    Returns:
+        bool: True si es válido, False si no.
+    """
+    try:
+        digitos = [int(ch) for ch in numero_tarjeta if ch.isdigit()]
+        suma = 0
+        par = False
+        for digito in reversed(digitos):
+            if par:
+                digito *= 2
+                if digito > 9:
+                    digito -= 9
+            suma += digito
+            par = not par
+        return suma % 10 == 0
+    except Exception:
+        return False
