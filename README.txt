@@ -1,1 +1,0 @@
-Examen de desarrollo software seguro by Grupo 1
