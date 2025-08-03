@@ -8,6 +8,13 @@ from .db import get_connection, init_db
 from .jwt_auth import create_jwt_manager, jwt_required
 import logging
 
+# Importar sistema de logging personalizado
+from .utils.middleware_logger import LoggingMiddleware
+from .logging.logger import registrar_evento, registrar_error, registrar_warning
+
+# Define a simple in-memory token store
+tokens = {}
+
 # Cargar variables de entorno desde .env
 load_dotenv()
 
@@ -33,6 +40,10 @@ authorizations = {
 }
 
 app = Flask(__name__)
+
+# Inicializar el middleware de logging personalizado
+logging_middleware = LoggingMiddleware(app)
+
 
 # Configurar JWT usando variables de entorno
 jwt_secret = os.getenv('JWT_SECRET_KEY')
@@ -93,6 +104,19 @@ class Login(Resource):
         username = data.get("username")
         password = data.get("password")
         
+        # Obtener IP para logging manual (mejorada para Docker)
+        ip_remota = request.headers.get('X-Forwarded-For')
+        if ip_remota:
+            ip_remota = ip_remota.split(',')[0].strip()
+        else:
+            ip_remota = request.headers.get('X-Real-IP') or request.remote_addr or 'unknown'
+        
+        # Si es IP de Docker, intentar obtener IP real del cliente
+        if ip_remota.startswith('172.'):
+            host_header = request.headers.get('Host', '')
+            if 'localhost' in host_header or '127.0.0.1' in host_header:
+                ip_remota = '127.0.0.1'
+        
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (username,))
@@ -111,10 +135,18 @@ class Login(Resource):
             
             cur.close()
             conn.close()
+            
+            # Log exitoso de login
+            registrar_evento('INFO', ip_remota, username, f"Login exitoso - usuario autenticado", 200)
+            
             return {"message": "Login successful", "token": token}, 200
         else:
             cur.close()
             conn.close()
+            
+            # Log de intento fallido de login
+            registrar_warning(ip_remota, username or 'unknown', f"Intento de login fallido - credenciales inválidas", 401)
+            
             api.abort(401, "Invalid credentials")
 
 @auth_ns.route('/logout')
@@ -124,6 +156,67 @@ class Logout(Resource):
     def post(self):
         """Invalida el token de autenticación (JWT no requiere invalidación en servidor)."""
         return {"message": "Logout successful"}, 200
+
+# ---------------- Token-Required Decorator ----------------
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        
+        # Obtener IP para logging manual 
+        ip_remota = request.headers.get('X-Forwarded-For')
+        if ip_remota:
+            ip_remota = ip_remota.split(',')[0].strip()
+        else:
+            ip_remota = request.headers.get('X-Real-IP') or request.remote_addr or 'unknown'
+        
+        # Si es IP de Docker, intentar obtener IP real del cliente
+        if ip_remota.startswith('172.'):
+            host_header = request.headers.get('Host', '')
+            if 'localhost' in host_header or '127.0.0.1' in host_header:
+                ip_remota = '127.0.0.1'
+        
+        if not auth_header.startswith("Bearer "):
+            registrar_warning(ip_remota, 'anon', "Acceso denegado - header de autorización faltante o inválido", 401)
+            api.abort(401, "Authorization header missing or invalid")
+            
+        token = auth_header.split(" ")[1]
+        logging.debug("Token: "+str(token))
+        
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            # Query the token in the database and join with users table to retrieve user info
+            cur.execute("""
+                SELECT u.id, u.username, u.role, u.full_name, u.email 
+                FROM bank.tokens t
+                JOIN bank.users u ON t.user_id = u.id
+                WHERE t.token = %s
+            """, (token,))
+            user = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if not user:
+                registrar_warning(ip_remota, 'token_invalido', "Acceso denegado - token inválido o expirado", 401)
+                api.abort(401, "Invalid or expired token")
+                
+            g.user = {
+                "id": user[0],
+                "username": user[1],
+                "role": user[2],
+                "full_name": user[3],
+                "email": user[4]
+            }
+            
+            return f(*args, **kwargs)
+            
+        except Exception as e:
+            registrar_error(ip_remota, 'system', f"Error en validación de token: {str(e)}", 500)
+            api.abort(500, "Internal server error during authentication")
+            
+    return decorated
 
 # ---------------- Banking Operation Endpoints ----------------
 
