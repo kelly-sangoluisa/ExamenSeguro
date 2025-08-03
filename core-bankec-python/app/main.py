@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 from .db import get_connection, init_db
 from .jwt_auth import create_jwt_manager, jwt_required
 from .validators import validate_cedula, validate_phone, validate_username, validate_password
-import logging
+# Importar sistema de logging personalizado a PostgreSQL
+from .logging import registrar_evento, registrar_warning, registrar_error, registrar_info, registrar_debug
 import bcrypt
 
 # Define a simple in-memory token store
@@ -54,32 +55,8 @@ def check_cedula_exists(cedula):
     conn.close()
     return exists
 
-# Funciones de logging (placeholders - necesitas implementar estas funciones)
-def registrar_evento(level, ip, user, message, status_code):
-    """Registra eventos en el log."""
-    logging.info(f"[{level}] {ip} - {user} - {message} - {status_code}")
-
-def registrar_warning(ip, user, message, status_code):
-    """Registra warnings en el log."""
-    logging.warning(f"{ip} - {user} - {message} - {status_code}")
-
-def registrar_error(ip, user, message, status_code):
-    """Registra errores en el log."""
-    logging.error(f"{ip} - {user} - {message} - {status_code}")
-
 # Cargar variables de entorno desde .env
 load_dotenv()
-
-# Configuración de logging
-logging.basicConfig(
-     filename="app.log",
-     level=logging.DEBUG,
-     encoding="utf-8",
-     filemode="a",
-     format="{asctime} - {levelname} - {message}",
-     style="{",
-     datefmt="%Y-%m-%d %H:%M",
-)
 
 # Configure Swagger security scheme for Bearer tokens
 authorizations = {
@@ -229,31 +206,38 @@ class Register(Resource):
         # 1. Validar campos requeridos
         if not all([client_data['nombres'], client_data['apellidos'], client_data['direccion'], 
                    client_data['cedula'], client_data['celular'], user_data['username'], user_data['password']]):
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Campos requeridos faltantes", 400)
             api.abort(400, "All required fields must be provided")
         
         # 2. Validar cédula ecuatoriana (debe ser válida)
         if not validate_cedula(client_data['cedula']):
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Cédula inválida: {client_data['cedula']}", 400)
             api.abort(400, "Invalid cedula format or verification digit")
         
         # 3. Validar número celular ecuatoriano (debe ser válido)
         if not validate_phone(client_data['celular']):
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Teléfono inválido", 400)
             api.abort(400, "Invalid phone number format")
         
         # 4. Validar username (solo números y letras, sin información personal)
         username_valid, username_msg = validate_username(user_data['username'], client_data)
         if not username_valid:
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Username inválido: {username_msg}", 400)
             api.abort(400, username_msg)
         
         # 5. Validar contraseña (8+ caracteres, números, letras, símbolos, sin info personal)
         password_valid, password_msg = validate_password(user_data['password'], client_data)
         if not password_valid:
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Contraseña inválida", 400)
             api.abort(400, password_msg)
         
         # 6. Verificar que no existan duplicados
         if check_username_exists(user_data['username']):
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Username ya existe", 409)
             api.abort(409, "Username already exists")
         
         if check_cedula_exists(client_data['cedula']):
+            registrar_warning(ip_address, user_data.get('username', 'unknown'), f"POST /auth/register | Intento de registro fallido - Cédula ya registrada", 409)
             api.abort(409, "Cedula already registered")
         
         # 7. Crear registros en base de datos (información separada)
@@ -309,7 +293,7 @@ class Register(Resource):
             conn.commit()
             
             # Log del registro exitoso
-            logging.info(f"Registro exitoso - usuario: {user_data['username']}, cliente_id: {client_id}, IP: {ip_address}")
+            registrar_info(ip_address, user_data['username'], f"Registro exitoso - cliente_id: {client_id}", 201)
             
             return {
                 "message": "Registration successful",
@@ -319,7 +303,7 @@ class Register(Resource):
             
         except Exception as db_error:
             conn.rollback()
-            logging.error(f"Error en base de datos durante registro: {str(db_error)}, IP: {ip_address}")
+            registrar_error(ip_address, user_data.get('username', 'unknown'), f"Error en base de datos durante registro: {str(db_error)}", 500)
             api.abort(500, f"Database error during registration: {str(db_error)}")
             
         finally:
@@ -349,7 +333,6 @@ def token_required(f):
             api.abort(401, "Authorization header missing or invalid")
             
         token = auth_header.split(" ")[1]
-        logging.debug("Token: "+str(token))
         
         try:
             conn = get_connection()
@@ -401,27 +384,43 @@ class Deposit(Resource):
         account_number = data.get("account_number")
         amount = data.get("amount", 0)
         
+        # Obtener información del usuario y IP
+        ip_remota = get_client_ip(request)
+        current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
+        
         if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/deposit | datos: {{account_number:{account_number}, amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
             api.abort(400, "Amount must be greater than zero")
         
-        conn = get_connection()
-        cur = conn.cursor()
-        # Update the specified account using its account number (primary key)
-        cur.execute(
-            "UPDATE bank.accounts SET balance = balance + %s WHERE id = %s RETURNING balance",
-            (amount, account_number)
-        )
-        result = cur.fetchone()
-        if not result:
-            conn.rollback()
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            # Update the specified account using its account number (primary key)
+            cur.execute(
+                "UPDATE bank.accounts SET balance = balance + %s WHERE id = %s RETURNING balance",
+                (amount, account_number)
+            )
+            result = cur.fetchone()
+            if not result:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/deposit | datos: {{account_number:***, amount}} | respuesta: 404 Not Found - Account not found", 404)
+                api.abort(404, "Account not found")
+            
+            new_balance = float(result[0])
+            conn.commit()
             cur.close()
             conn.close()
-            api.abort(404, "Account not found")
-        new_balance = float(result[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Deposit successful", "new_balance": new_balance}, 200
+            
+            # Log de operación exitosa
+            registrar_info(ip_remota, current_user, f"POST /bank/deposit | datos: {{account_number:***, amount}} | respuesta: 200 OK", 200)
+            
+            return {"message": "Deposit successful", "new_balance": new_balance}, 200
+            
+        except Exception as e:
+            registrar_error(ip_remota, current_user, f"POST /bank/deposit | Error en depósito: {str(e)}", 500)
+            api.abort(500, f"Error processing deposit: {str(e)}")
 
 @bank_ns.route('/withdraw')
 class Withdraw(Resource):
@@ -432,28 +431,49 @@ class Withdraw(Resource):
         """Realiza un retiro de la cuenta del usuario autenticado."""
         data = api.payload
         amount = data.get("amount", 0)
+        
+        # Obtener información del usuario y IP
+        ip_remota = get_client_ip(request)
+        current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
+        
         if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/withdraw | datos: {{amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
             api.abort(400, "Amount must be greater than zero")
+            
         user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
+        
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/withdraw | datos: {{amount}} | respuesta: 404 Not Found - Account not found", 404)
+                api.abort(404, "Account not found")
+                
+            current_balance = float(row[0])
+            if current_balance < amount:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/withdraw | datos: {{amount}} | respuesta: 400 Bad Request - Insufficient funds", 400)
+                api.abort(400, "Insufficient funds")
+                
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s RETURNING balance", (amount, user_id))
+            new_balance = float(cur.fetchone()[0])
+            conn.commit()
             cur.close()
             conn.close()
-            api.abort(404, "Account not found")
-        current_balance = float(row[0])
-        if current_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds")
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s RETURNING balance", (amount, user_id))
-        new_balance = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
+            
+            # Log de operación exitosa
+            registrar_info(ip_remota, current_user, f"POST /bank/withdraw | datos: {{amount}} | respuesta: 200 OK", 200)
+            
+            return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
+            
+        except Exception as e:
+            registrar_error(ip_remota, current_user, f"POST /bank/withdraw | Error en retiro: {str(e)}", 500)
+            api.abort(500, f"Error processing withdrawal: {str(e)}")
 
 @bank_ns.route('/transfer')
 class Transfer(Resource):
@@ -465,41 +485,65 @@ class Transfer(Resource):
         data = api.payload
         target_username = data.get("target_username")
         amount = data.get("amount", 0)
-        if not target_username or amount <= 0:
-            api.abort(400, "Invalid data")
-        if target_username == g.user['username']:
-            api.abort(400, "Cannot transfer to the same account")
-        conn = get_connection()
-        cur = conn.cursor()
-        # Check sender's balance
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Sender account not found")
-        sender_balance = float(row[0])
-        if sender_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds")
-        # Find target user
-        cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
-        target_user = cur.fetchone()
-        if not target_user:
-            cur.close()
-            conn.close()
-            api.abort(404, "Target user not found")
-        target_user_id = target_user[0]
         
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, g.user['id']))
-        cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", (amount, target_user_id))
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-        new_balance = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Transfer successful", "new_balance": new_balance}, 200
+        # Obtener información del usuario y IP
+        ip_remota = get_client_ip(request)
+        current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
+        
+        if not target_username or amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username:{target_username}, amount:{amount}}} | respuesta: 400 Bad Request - Invalid data", 400)
+            api.abort(400, "Invalid data")
+            
+        if target_username == g.user['username']:
+            registrar_warning(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username:{target_username}, amount}} | respuesta: 400 Bad Request - Cannot transfer to the same account", 400)
+            api.abort(400, "Cannot transfer to the same account")
+            
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            # Check sender's balance
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username, amount}} | respuesta: 404 Not Found - Sender account not found", 404)
+                api.abort(404, "Sender account not found")
+                
+            sender_balance = float(row[0])
+            if sender_balance < amount:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username, amount}} | respuesta: 400 Bad Request - Insufficient funds", 400)
+                api.abort(400, "Insufficient funds")
+                
+            # Find target user
+            cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
+            target_user = cur.fetchone()
+            if not target_user:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username, amount}} | respuesta: 404 Not Found - Target user not found", 404)
+                api.abort(404, "Target user not found")
+                
+            target_user_id = target_user[0]
+            
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, g.user['id']))
+            cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", (amount, target_user_id))
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
+            new_balance = float(cur.fetchone()[0])
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            # Log de operación exitosa
+            registrar_info(ip_remota, current_user, f"POST /bank/transfer | datos: {{target_username, amount}} | respuesta: 200 OK", 200)
+            
+            return {"message": "Transfer successful", "new_balance": new_balance}, 200
+            
+        except Exception as e:
+            registrar_error(ip_remota, current_user, f"POST /bank/transfer | Error en transferencia: {str(e)}", 500)
+            api.abort(500, f"Error processing transfer: {str(e)}")
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
@@ -514,37 +558,57 @@ class CreditPayment(Resource):
         """
         data = api.payload
         amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
-        user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
         
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
-        cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        new_account_balance = float(cur.fetchone()[0])
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        new_credit_balance = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {
-            "message": "Credit card purchase successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_balance
-        }, 200
+        # Obtener información del usuario y IP
+        ip_remota = get_client_ip(request)
+        current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
+        
+        if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
+            api.abort(400, "Amount must be greater than zero")
+            
+        user_id = g.user['id']
+        
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 404 Not Found - Account not found", 404)
+                api.abort(404, "Account not found")
+                
+            account_balance = float(row[0])
+            if account_balance < amount:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 400 Bad Request - Insufficient funds in account", 400)
+                api.abort(400, "Insufficient funds in account")
+            
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
+            cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            new_account_balance = float(cur.fetchone()[0])
+            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
+            new_credit_balance = float(cur.fetchone()[0])
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            # Log de operación exitosa
+            registrar_info(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 200 OK", 200)
+            
+            return {
+                "message": "Credit card purchase successful",
+                "account_balance": new_account_balance,
+                "credit_card_debt": new_credit_balance
+            }, 200
+            
+        except Exception as e:
+            registrar_error(ip_remota, current_user, f"POST /bank/credit-payment | Error en compra a crédito: {str(e)}", 500)
+            api.abort(500, f"Error processing credit payment: {str(e)}")
 
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):
@@ -559,47 +623,70 @@ class PayCreditBalance(Resource):
         """
         data = api.payload
         amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
-        user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        # Check account funds
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
-        # Get current credit card debt
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Credit card not found")
-        credit_debt = float(row[0])
-        payment = min(amount, credit_debt)
         
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-        cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        new_account_balance = float(cur.fetchone()[0])
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        new_credit_debt = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {
-            "message": "Credit card debt payment successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_debt
-        }, 200
+        # Obtener información del usuario y IP
+        ip_remota = get_client_ip(request)
+        current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
+        
+        if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
+            api.abort(400, "Amount must be greater than zero")
+            
+        user_id = g.user['id']
+        
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            # Check account funds
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 404 Not Found - Account not found", 404)
+                api.abort(404, "Account not found")
+                
+            account_balance = float(row[0])
+            if account_balance < amount:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 400 Bad Request - Insufficient funds in account", 400)
+                api.abort(400, "Insufficient funds in account")
+                
+            # Get current credit card debt
+            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 404 Not Found - Credit card not found", 404)
+                api.abort(404, "Credit card not found")
+                
+            credit_debt = float(row[0])
+            payment = min(amount, credit_debt)
+            
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+            cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
+            new_account_balance = float(cur.fetchone()[0])
+            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
+            new_credit_debt = float(cur.fetchone()[0])
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            # Log de operación exitosa
+            registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 200 OK", 200)
+            
+            return {
+                "message": "Credit card debt payment successful",
+                "account_balance": new_account_balance,
+                "credit_card_debt": new_credit_debt
+            }, 200
+            
+        except Exception as e:
+            registrar_error(ip_remota, current_user, f"POST /bank/pay-credit-balance | Error en pago de deuda: {str(e)}", 500)
+            api.abort(500, f"Error processing credit balance payment: {str(e)}")
 
 # CORREGIDO: Usar el nuevo decorador para Flask 2.0+
 @app.before_request
