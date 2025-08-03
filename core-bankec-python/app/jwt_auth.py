@@ -1,7 +1,3 @@
-"""
-JWT Authentication Module
-Maneja la autenticación JWT para la API bancaria
-"""
 
 import jwt
 import datetime
