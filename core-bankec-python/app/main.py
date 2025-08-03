@@ -1,17 +1,38 @@
-import secrets
 import os
-from flask import Flask, request, g
-from flask_restx import Api, Resource, fields # type: ignore
-from functools import wraps
-from dotenv import load_dotenv
-from .db import get_connection, init_db
-from .jwt_auth import create_jwt_manager, jwt_required
-from .validators import validate_cedula, validate_phone, validate_username, validate_password
-# Importar sistema de logging personalizado a PostgreSQL
-from .logging import registrar_evento, registrar_warning, registrar_error, registrar_info, registrar_debug
+import secrets
+import logging
 import bcrypt
 
-# Define a simple in-memory token store
+from functools import wraps
+from flask import Flask, request, g
+from flask_restx import Api, Resource, fields  # type: ignore
+from dotenv import load_dotenv
+
+# Módulos internos
+from .db import get_connection, init_db
+from .jwt_auth import create_jwt_manager, jwt_required
+from .validators import (
+    validate_cedula,
+    validate_phone,
+    validate_username,
+    validate_password,
+    validar_tarjeta_luhn  # Solo uno de los archivos lo tiene, pero es útil
+)
+
+# Funcionalidad extra de seguridad y autenticación
+from .secure_storage import cifrar_dato, descifrar_dato
+from app.utils.otp_manager import verificar_otp
+
+# Logging personalizado a PostgreSQL
+from .logging import (
+    registrar_evento,
+    registrar_warning,
+    registrar_error,
+    registrar_info,
+    registrar_debug
+)
+
+# Token store en memoria
 tokens = {}
 
 # Funciones auxiliares para registro
@@ -554,146 +575,305 @@ class Transfer(Resource):
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
-    @bank_ns.expect(credit_payment_model, validate=True)
-    @bank_ns.doc('credit_payment')
+    @bank_ns.expect(bank_ns.model('SecureCreditPayment', {
+        'amount': fields.Float(required=True, description='Monto de compra'),
+        'card_number': fields.String(required=True, description='Número completo de la tarjeta'),
+        'cvv': fields.String(required=True, description='Código CVV'),
+        'expiry': fields.String(required=True, description='Fecha de expiración MM/YY'),
+        'otp': fields.String(required=True, description='Código OTP'),
+        'store_id': fields.Integer(required=True, description='ID del establecimiento')
+    }), validate=True)
+    @bank_ns.doc('credit_payment_secure')
     @jwt_required
     def post(self):
         """
-        Realiza una compra a crédito:
-        - Descuenta el monto de la cuenta.
-        - Aumenta la deuda de la tarjeta de crédito.
+        Realiza una compra segura con tarjeta de crédito (TCE-04):
+        - Valida tarjeta (Luhn)
+        - Verifica OTP
+        - Cifra y guarda tarjeta si no existe
+        - Verifica comercio
+        - Descuenta saldo y registra deuda
+        - Registra logs detallados
         """
         data = api.payload
-        amount = data.get("amount", 0)
-        
-        # Obtener información del usuario y IP
         ip_remota = get_client_ip(request)
         current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
-        
-        if amount <= 0:
-            registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
-            api.abort(400, "Amount must be greater than zero")
-            
         user_id = g.user['id']
-        
+
+        # Validar campos
+        amount = float(data.get('amount', 0))
+        if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | Monto inválido: {amount}", 400)
+            api.abort(400, "Monto inválido")
+
+        card_number = data['card_number'].replace(" ", "")
+        cvv = data['cvv']
+        expiry = data['expiry']
+        otp = data['otp']
+        store_id = data['store_id']
+
+        if not validar_tarjeta_luhn(card_number):
+            registrar_warning(ip_remota, current_user, "POST /bank/credit-payment | Tarjeta inválida", 400)
+            api.abort(400, "Número de tarjeta inválido")
+
+        if not verificar_otp(user_id, otp):
+            registrar_warning(ip_remota, current_user, "POST /bank/credit-payment | OTP inválido", 401)
+            api.abort(401, "OTP inválido o expirado")
+
+        conn = get_connection()
+        cur = conn.cursor()
+
         try:
-            conn = get_connection()
-            cur = conn.cursor()
+            # Verificar comercio
+            cur.execute("SELECT id FROM bank.establishments WHERE id = %s AND estado = TRUE", (store_id,))
+            comercio = cur.fetchone()
+            if not comercio:
+                registrar_warning(ip_remota, current_user, "POST /bank/credit-payment | Comercio no encontrado", 400)
+                return {"message": "Establecimiento no registrado"}, 400
+
+            # Verificar fondos
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                cur.close()
-                conn.close()
-                registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 404 Not Found - Account not found", 404)
-                api.abort(404, "Account not found")
-                
-            account_balance = float(row[0])
-            if account_balance < amount:
-                cur.close()
-                conn.close()
-                registrar_warning(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 400 Bad Request - Insufficient funds in account", 400)
-                api.abort(400, "Insufficient funds in account")
-            
+            cuenta = cur.fetchone()
+            if not cuenta or float(cuenta[0]) < amount:
+                registrar_warning(ip_remota, current_user, "POST /bank/credit-payment | Fondos insuficientes", 400)
+                return {"message": "Fondos insuficientes"}, 400
+
+            # Verificar si tarjeta ya fue registrada
+            tarjeta_cifrada = cifrar_dato(card_number)
+            cur.execute("SELECT id FROM bank.secure_cards WHERE user_id = %s AND card_number = %s", (user_id, tarjeta_cifrada))
+            tarjeta_existente = cur.fetchone()
+
+            if not tarjeta_existente:
+                # Guardar tarjeta
+                cur.execute("""
+                    INSERT INTO bank.secure_cards (user_id, card_number, cvv, expiry)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    user_id,
+                    tarjeta_cifrada,
+                    cifrar_dato(cvv),
+                    cifrar_dato(expiry)
+                ))
+
+            # Ejecutar transacción
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+
+            # Obtener nuevos balances
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            new_account_balance = float(cur.fetchone()[0])
+            nuevo_saldo = float(cur.fetchone()[0])
             cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-            new_credit_balance = float(cur.fetchone()[0])
+            nueva_deuda = float(cur.fetchone()[0])
+
             conn.commit()
+            registrar_info(ip_remota, current_user, f"POST /bank/credit-payment | Compra exitosa por ${amount}", 200)
+
+            return {
+                "message": "Compra a crédito exitosa",
+                "store_id": store_id,
+                "amount": amount,
+                "account_balance": nuevo_saldo,
+                "credit_card_debt": nueva_deuda
+            }, 200
+
+        except Exception as e:
+            conn.rollback()
+            registrar_error(ip_remota, current_user, f"POST /bank/credit-payment | Error inesperado: {str(e)}", 500)
+            return {"message": f"Error en la operación: {str(e)}"}, 500
+
+        finally:
             cur.close()
             conn.close()
-            
-            # Log de operación exitosa
-            registrar_info(ip_remota, current_user, f"POST /bank/credit-payment | datos: {{amount}} | respuesta: 200 OK", 200)
-            
-            return {
-                "message": "Credit card purchase successful",
-                "account_balance": new_account_balance,
-                "credit_card_debt": new_credit_balance
-            }, 200
-            
-        except Exception as e:
-            registrar_error(ip_remota, current_user, f"POST /bank/credit-payment | Error en compra a crédito: {str(e)}", 500)
-            api.abort(500, f"Error processing credit payment: {str(e)}")
 
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):
-    @bank_ns.expect(pay_credit_balance_model, validate=True)
-    @bank_ns.doc('pay_credit_balance')
+    @bank_ns.expect(bank_ns.model('SecurePayCreditBalance', {
+        'amount': fields.Float(required=True, description='Monto a pagar'),
+        'first6': fields.String(required=True, description='Primeros 6 dígitos de la tarjeta'),
+        'otp': fields.String(required=True, description='Código OTP'),
+        'card_number': fields.String(required=True, description='Número completo de tarjeta'),
+        'cvv': fields.String(required=True, description='CVV'),
+        'expiry': fields.String(required=True, description='Fecha de expiración MM/YY'),
+    }), validate=True)
+    @bank_ns.doc('secure_pay_credit_balance')
     @jwt_required
     def post(self):
         """
-        Realiza un abono a la deuda de la tarjeta:
-        - Descuenta el monto (o el máximo posible) de la cuenta.
-        - Reduce la deuda de la tarjeta de crédito.
+        Realiza un abono a la deuda de la tarjeta (cumple TCE-05):
+        - Valida primeros 6 dígitos vs tarjeta.
+        - Valida tarjeta (Luhn) y OTP.
+        - Permite tarjetas internas y externas.
+        - Cifra y guarda datos si es nueva tarjeta.
+        - Registra logs detallados.
         """
         data = api.payload
-        amount = data.get("amount", 0)
-        
-        # Obtener información del usuario y IP
+        amount = float(data.get("amount", 0))
+        otp = data.get("otp")
+        first6 = data.get("first6")
+        full_card = data.get("card_number").replace(" ", "")
+        cvv = data.get("cvv")
+        expiry = data.get("expiry")
+
         ip_remota = get_client_ip(request)
         current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
-        
-        if amount <= 0:
-            registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount:{amount}}} | respuesta: 400 Bad Request - Amount must be greater than zero", 400)
-            api.abort(400, "Amount must be greater than zero")
-            
         user_id = g.user['id']
-        
+
+        if amount <= 0:
+            registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | Monto inválido: {amount} | respuesta: 400", 400)
+            api.abort(400, "Amount must be greater than zero")
+
+        if not validar_tarjeta_luhn(full_card):
+            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta inválida | respuesta: 400", 400)
+            api.abort(400, "Número de tarjeta inválido")
+
+        if not full_card.startswith(first6):
+            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Prefijo de tarjeta no coincide | respuesta: 400", 400)
+            api.abort(400, "Los primeros 6 dígitos no coinciden con la tarjeta")
+
+        if not verificar_otp(user_id, otp):
+            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | OTP inválido | respuesta: 401", 401)
+            api.abort(401, "OTP inválido o expirado")
+
+        conn = get_connection()
+        cur = conn.cursor()
+
         try:
-            conn = get_connection()
-            cur = conn.cursor()
-            # Check account funds
+            # Verificar si tarjeta ya está registrada
+            tarjeta_cifrada = cifrar_dato(full_card)
+            cur.execute("""
+                SELECT id FROM bank.secure_cards
+                WHERE user_id = %s AND card_number = %s
+            """, (user_id, tarjeta_cifrada))
+            es_tarjeta_interna = cur.fetchone() is not None
+
+            # Obtener saldo
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                cur.close()
-                conn.close()
-                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 404 Not Found - Account not found", 404)
-                api.abort(404, "Account not found")
-                
-            account_balance = float(row[0])
-            if account_balance < amount:
-                cur.close()
-                conn.close()
-                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 400 Bad Request - Insufficient funds in account", 400)
-                api.abort(400, "Insufficient funds in account")
-                
-            # Get current credit card debt
+            cuenta = cur.fetchone()
+            if not cuenta:
+                registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Cuenta no encontrada", 404)
+                return {"message": "Cuenta no encontrada"}, 404
+            if float(cuenta[0]) < amount:
+                registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Fondos insuficientes", 400)
+                return {"message": "Fondos insuficientes"}, 400
+
+            # Obtener deuda
             cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                cur.close()
-                conn.close()
-                registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 404 Not Found - Credit card not found", 404)
-                api.abort(404, "Credit card not found")
-                
-            credit_debt = float(row[0])
-            payment = min(amount, credit_debt)
-            
+            deuda = cur.fetchone()
+            if not deuda:
+                registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta de crédito no encontrada", 404)
+                return {"message": "No se encontró tarjeta de crédito"}, 404
+
+            payment = min(amount, float(deuda[0]))
+
+            # Realizar descuento
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+
+            # Registrar tarjeta externa si es nueva
+            if not es_tarjeta_interna:
+                masked_card = f"{full_card[:6]}******{full_card[-4:]}"
+                cur.execute("SELECT id FROM bank.stored_cards WHERE user_id = %s AND encrypted_card_number = %s", (user_id, tarjeta_cifrada))
+                if not cur.fetchone():
+                    cur.execute("""
+                        INSERT INTO bank.stored_cards (
+                            user_id, masked_card, encrypted_card_number,
+                            encrypted_expiry, encrypted_cvv
+                        ) VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        user_id,
+                        masked_card,
+                        tarjeta_cifrada,
+                        cifrar_dato(expiry),
+                        cifrar_dato(cvv)
+                    ))
+
+            # Obtener nuevos saldos
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            new_account_balance = float(cur.fetchone()[0])
+            nuevo_saldo = float(cur.fetchone()[0])
             cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-            new_credit_debt = float(cur.fetchone()[0])
+            nueva_deuda = float(cur.fetchone()[0])
+
             conn.commit()
+            registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | Pago exitoso de ${payment}", 200)
+
+            return {
+                "message": "Pago exitoso de deuda con tarjeta",
+                "account_balance": nuevo_saldo,
+                "credit_card_debt": nueva_deuda
+            }, 200
+
+        except Exception as e:
+            conn.rollback()
+            registrar_error(ip_remota, current_user, f"POST /bank/pay-credit-balance | Error inesperado: {str(e)}", 500)
+            return {"message": f"Error durante la operación: {str(e)}"}, 500
+
+        finally:
             cur.close()
             conn.close()
-            
-            # Log de operación exitosa
-            registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | datos: {{amount}} | respuesta: 200 OK", 200)
-            
-            return {
-                "message": "Credit card debt payment successful",
-                "account_balance": new_account_balance,
-                "credit_card_debt": new_credit_debt
-            }, 200
-            
+
+@bank_ns.route('/my-cards')
+class MyCards(Resource):
+    @bank_ns.doc('get_user_cards')
+    @jwt_required
+    def get(self):
+        """
+        Devuelve todas las tarjetas registradas por el usuario:
+        - Internas (`secure_cards`) con deuda
+        - Externas (`stored_cards`)
+        Todos los números están enmascarados.
+        """
+        user_id = g.user['id']
+        ip_remota = get_client_ip(request)
+        usuario = g.user.get('username', 'unknown')
+
+        conn = get_connection()
+        cur = conn.cursor()
+        tarjetas = []
+
+        try:
+            # Tarjetas internas (secure_cards)
+            cur.execute("""
+                SELECT card_number, expiry, balance 
+                FROM bank.secure_cards sc
+                JOIN bank.credit_cards cc ON sc.user_id = cc.user_id
+                WHERE sc.user_id = %s
+            """, (user_id,))
+            for row in cur.fetchall():
+                card = descifrar_dato(row[0])
+                masked = f"{card[:6]}******{card[-4:]}"
+
+                tarjetas.append({
+                    "type": "secure",
+                    "card": masked,
+                    "expiry": descifrar_dato(row[1]),
+                    "debt": float(row[2])
+                })
+
+            # Tarjetas externas (stored_cards)
+            cur.execute("""
+                SELECT masked_card, encrypted_expiry 
+                FROM bank.stored_cards 
+                WHERE user_id = %s
+            """, (user_id,))
+            for row in cur.fetchall():
+                tarjetas.append({
+                    "type": "stored",
+                    "card": row[0],
+                    "expiry": descifrar_dato(row[1]),
+                    "debt": None
+                })
+
+            registrar_info(ip_remota, usuario, "GET /bank/my-cards | Consulta exitosa", 200)
+            return {"cards": tarjetas}, 200
+
         except Exception as e:
-            registrar_error(ip_remota, current_user, f"POST /bank/pay-credit-balance | Error en pago de deuda: {str(e)}", 500)
-            api.abort(500, f"Error processing credit balance payment: {str(e)}")
+            conn.rollback()
+            registrar_error(ip_remota, usuario, f"GET /bank/my-cards | Error al obtener tarjetas: {str(e)}", 500)
+            return {"message": f"Error obteniendo tarjetas: {str(e)}"}, 500
+
+        finally:
+            cur.close()
+            conn.close()
 
 # CORREGIDO: Usar el nuevo decorador para Flask 2.0+
 @app.before_request
