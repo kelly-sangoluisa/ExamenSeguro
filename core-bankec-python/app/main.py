@@ -631,12 +631,12 @@ class PayCreditBalance(Resource):
     @bank_ns.doc('secure_pay_credit_balance')
     @jwt_required
     def post(self):
-        """
-        Realiza un abono a la deuda de la tarjeta (cumple TCE-05):
-        - Solicita primeros 6 dígitos de tarjeta para validación.
-        - Permite pagar con tarjetas internas o registrar externas.
-        - Verifica OTP.
-        - Cifra los datos sensibles.
+       """
+        Permite abonar a la deuda de una tarjeta de crédito:
+        - Valida tarjeta y primeros 6 dígitos.
+        - Verifica OTP (doble factor).
+        - Cifra datos sensibles si la tarjeta es externa.
+        - Descuenta saldo de cuenta y actualiza la deuda.
         """
         data = api.payload
         user_id = g.user['id']
@@ -646,16 +646,16 @@ class PayCreditBalance(Resource):
         full_card = data.get("card_number").replace(" ", "")
         cvv = data.get("cvv")
         expiry = data.get("expiry")
-
+# Validar monto
         if amount <= 0:
             api.abort(400, "Amount must be greater than zero")
-
+# Validar tarjeta (Luhn y primeros 6 dígitos)
         if not validar_tarjeta_luhn(full_card):
             api.abort(400, "Número de tarjeta inválido")
 
         if not full_card.startswith(first6):
             api.abort(400, "Los primeros 6 dígitos no coinciden con la tarjeta")
-
+# Verificar OTP
         if not verificar_otp(user_id, otp):
             api.abort(401, "OTP inválido o expirado")
 
@@ -671,7 +671,7 @@ class PayCreditBalance(Resource):
             """, (user_id, tarjeta_cifrada))
             es_tarjeta_interna = cur.fetchone() is not None
 
-            # Obtener fondos del usuario
+             # Validar saldo del usuario
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
             cuenta = cur.fetchone()
             if not cuenta or float(cuenta[0]) < amount:
