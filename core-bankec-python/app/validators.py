@@ -62,31 +62,38 @@ def validate_username(username, personal_info):
     return True, "Valid username"
 
 def validate_password(password, personal_info):
-    """Valida que la contraseña cumpla los requisitos de TCE-07."""
+    """
+    Valida que la contraseña cumpla los requisitos de seguridad (TCE-07):
+    - Longitud mínima de 8 caracteres.
+    - Debe incluir letras, números y símbolos.
+    - No debe contener información personal del usuario.
+    """
+    # Verificar longitud mínima
     if not password or len(password) < 8:
         return False, "Password must be at least 8 characters long"
     
     # Verificar que contenga letras, números y símbolos
-    has_letter = bool(re.search(r'[a-zA-Z]', password))
-    has_number = bool(re.search(r'\d', password))
-    has_symbol = bool(re.search(r'[!@#$%^&*(),.?":{}|<>]', password))
+    has_letter = bool(re.search(r'[a-zA-Z]', password)) # Debe contener al menos una letra
+    has_number = bool(re.search(r'\d', password))       # Debe contener al menos un número
+    has_symbol = bool(re.search(r'[!@#$%^&*(),.?":{}|<>]', password))   # Debe contener al menos un símbolo
     
     if not (has_letter and has_number and has_symbol):
         return False, "Password must contain letters, numbers, and symbols"
     
-    # No puede contener información personal
+    #  Convertir contraseña a minúsculas para comparación
     password_lower = password.lower()
+    # Datos personales a evitar dentro de esta contraseña
     personal_data = [
         personal_info.get('nombres', '').lower(),
         personal_info.get('apellidos', '').lower(),
         personal_info.get('cedula', ''),
         personal_info.get('celular', ''),
     ]
-    
+    # Verificar que la contraseña no incluya datos personales relevantes
     for data in personal_data:
         if data and len(data) >= 3 and data in password_lower:
             return False, "Password cannot contain personal information"
-    
+    # Si pasa todas las validaciones, la contraseña es válida
     return True, "Valid password"
 
 def validar_tarjeta_luhn(numero_tarjeta):
