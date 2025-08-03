@@ -105,9 +105,9 @@ def create_jwt_manager(app):
         JWTManager: Instancia configurada del gestor JWT
     """
     # Usar la clave secreta del .env o una por defecto (menos segura)
-    secret_key = os.getenv('JWT_SECRET_KEY', 'fallback-key-change-in-production')
+    secret_key = os.getenv('JWT_SECRET_KEY')
     
-    # Usar tiempo de expiración del .env o valor por defecto (15 minutos)
+    # Usar tiempo de expiración del .env 
     expiry_hours = float(os.getenv('JWT_EXPIRATION_HOURS', 0.25))
     
     return JWTManager(secret_key, token_expiry_hours=expiry_hours)
