@@ -1,6 +1,6 @@
 # app/utils/otp_manager.py
 
-import random
+import secrets
 import time
 
 # Estructura: { user_id: (otp, timestamp_de_expiración) }
@@ -8,7 +8,7 @@ otp_storage = {}
 
 def generar_otp(user_id, minutos_validez=5):
     """Genera un OTP de 6 dígitos y lo almacena con expiración."""
-    otp = str(random.randint(100000, 999999))
+    otp = ''.join(str(secrets.randbelow(10)) for _ in range(6))
     expira_en = time.time() + minutos_validez * 60
     otp_storage[user_id] = (otp, expira_en)
     return otp
