@@ -14,6 +14,9 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # Copiar el código de la aplicación
 COPY app/ ./app/
 
+# Copiar el archivo .env
+COPY .env .
+
 # Exponer el puerto 8000
 EXPOSE 8000
 
