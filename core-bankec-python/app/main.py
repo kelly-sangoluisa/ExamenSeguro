@@ -21,7 +21,7 @@ from .validators import (
 
 # Funcionalidad extra de seguridad y autenticación
 from .secure_storage import cifrar_dato, descifrar_dato
-from app.utils.otp_manager import verificar_otp
+from app.utils.otp_manager import generar_otp, verificar_otp
 
 # Logging personalizado a PostgreSQL
 from .logging import (
@@ -119,6 +119,10 @@ api = Api(
 # Create namespaces for authentication and bank operations
 auth_ns = api.namespace('auth', description='Operaciones de autenticación')
 bank_ns = api.namespace('bank', description='Operaciones bancarias')
+otp_ns = api.namespace('otp', description='Operaciones OTP')
+
+# Registrar namespaces
+api.add_namespace(otp_ns)
 
 # Define the expected payload models for Swagger
 login_model = auth_ns.model('Login', {
@@ -157,6 +161,10 @@ credit_payment_model = bank_ns.model('CreditPayment', {
 
 pay_credit_balance_model = bank_ns.model('PayCreditBalance', {
     'amount': fields.Float(required=True, description='Monto a abonar a la deuda de la tarjeta', example=50)
+})
+
+otp_request = otp_ns.model("OTPRequest", {
+    "user_id": fields.String(required=True, description="ID del usuario")
 })
 
 # ---------------- Authentication Endpoints ----------------
@@ -572,6 +580,29 @@ class Transfer(Resource):
         except Exception as e:
             registrar_error(ip_remota, current_user, f"POST /bank/transfer | Error en transferencia: {str(e)}", 500)
             api.abort(500, f"Error processing transfer: {str(e)}")
+
+@otp_ns.route('/generate')
+class GenerateOTP(Resource):
+    @otp_ns.doc('generate_otp')
+    @jwt_required
+    def post(self):
+        """
+        Genera un OTP único de un solo uso para el usuario autenticado.
+        No se requiere enviar el user_id explícitamente.
+        """
+        user_id = g.user['id']
+        username = g.user.get('username', 'unknown')
+        ip_remota = request.headers.get('X-Forwarded-For', request.remote_addr)
+
+        otp = generar_otp(user_id)
+
+        # Log del evento
+        registrar_info(ip_remota, username, f"OTP generado: {otp}", 200)
+
+        return {
+            "message": "OTP generado exitosamente",
+            "otp": otp  # Mostrar solo en entorno de pruebas
+        }, 200
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
