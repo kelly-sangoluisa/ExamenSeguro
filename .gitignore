@@ -1,0 +1,16 @@
+# Ignorar archivos y carpetas generados automáticamente
+__pycache__/
+*.pyc
+*.pyo
+
+# Archivos de entorno y configuración local
+.env
+
+# Archivos de logs
+*.log
+
+# Archivos de bases de datos locales
+*.sqlite3
+
+# Archivos de Docker
+pgdata/
