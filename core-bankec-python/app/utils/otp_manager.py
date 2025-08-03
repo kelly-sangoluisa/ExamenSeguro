@@ -1,7 +1,6 @@
 # app/utils/otp_manager.py
-# 
+
 # ALMACENAMIENTO DE OTPs (en memoria)
-# 
 import secrets
 import time
 
@@ -16,12 +15,12 @@ def generar_otp(user_id, minutos_validez=5):
         minutos_validez (int): Tiempo de validez del OTP en minutos (por defecto 5 min).
 
     Returns:
-        str: OTP generado ( se forma una cadena de 6 dígitos).
+        str: OTP generado (se forma una cadena de 6 dígitos).
 
     Seguridad:
-    - Se utiliza la librería secrets para asi poder generar números criptográficamente  y asi que sean seguros.
-    - Cada OTP  que se va  almacenando tiene su tiempo de expiración para evitar reutilización.
-    - Este mecanismo puede mejorarse si esque nosotros  implementamos un  almacenamiento en una base de datos.
+    - Se utiliza la librería secrets para generar números criptográficamente seguros.
+    - Cada OTP almacenado tiene su tiempo de expiración para evitar reutilización.
+    - Este mecanismo puede mejorarse implementando un almacenamiento en base de datos.
     """
     otp = ''.join(str(secrets.randbelow(10)) for _ in range(6))
     expira_en = time.time() + minutos_validez * 60
@@ -29,11 +28,11 @@ def generar_otp(user_id, minutos_validez=5):
     return otp
 
 def verificar_otp(user_id, otp_ingresado):
-     """
+    """
     Verifica si un OTP que ha sido ingresado es válido para un usuario específico.
 
     Args:
-        user_id (int/str): es el  identificador del usuario.
+        user_id (int/str): es el identificador del usuario.
         otp_ingresado (str): OTP proporcionado por el usuario.
 
     Returns:
