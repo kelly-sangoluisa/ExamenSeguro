@@ -10,7 +10,7 @@ Se recomienda borrar los volumnes anteriores ya que se hicieron modificaciones e
 
 ## 🔑 Configuración de Variables de Entorno
 
-### **JWT**
+Crear core-bankec-python/.env
 Estas variables son necesarias para la configuración de autenticación JWT y FERNET:
 ```plaintext
 # Configuración JWT
