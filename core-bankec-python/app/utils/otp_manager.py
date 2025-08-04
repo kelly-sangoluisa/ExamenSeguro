@@ -88,7 +88,7 @@ def verificar_otp(user_id, otp_ingresado):
     return False
 
 def limpiar_otps_expirados():
-    """Elimina OTPs expirados del almacenamiento."""
+
     tiempo_actual = time.time()
     users_to_remove = []
     
