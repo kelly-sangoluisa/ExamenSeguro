@@ -718,30 +718,38 @@ class CreditPayment(Resource):
 
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):
-    @bank_ns.expect(bank_ns.model('SecurePayCreditBalance', {
+    @bank_ns.expect(bank_ns.model('FlexiblePayCreditBalance', {
         'amount': fields.Float(required=True, description='Monto a pagar'),
         'first6': fields.String(required=True, description='Primeros 6 dígitos de la tarjeta'),
         'otp': fields.String(required=True, description='Código OTP'),
-        'card_number': fields.String(required=True, description='Número completo de tarjeta'),
-        'cvv': fields.String(required=True, description='CVV'),
-        'expiry': fields.String(required=True, description='Fecha de expiración MM/YY'),
+        # Campos opcionales para tarjetas nuevas
+        'card_number': fields.String(required=False, description='Número completo de tarjeta (solo para tarjetas nuevas)'),
+        'cvv': fields.String(required=False, description='CVV (solo para tarjetas nuevas)'),
+        'expiry': fields.String(required=False, description='Fecha de expiración MM/YY (solo para tarjetas nuevas)'),
     }), validate=True)
-    @bank_ns.doc('secure_pay_credit_balance')
+    @bank_ns.doc('flexible_pay_credit_balance')
     @jwt_required
     def post(self):
         """
-        Realiza un abono a la deuda de la tarjeta (cumple TCE-05):
-        - Valida primeros 6 dígitos vs tarjeta.
-        - Valida tarjeta (Luhn) y OTP.
-        - Permite tarjetas internas y externas.
-        - Cifra y guarda datos si es nueva tarjeta.
-        - Registra logs detallados.
+        Realiza un abono a la deuda de la tarjeta (TCE-05 mejorado):
+        
+        FLUJO INTELIGENTE:
+        1. Si la tarjeta está registrada: Solo requiere amount, first6, otp
+        2. Si es tarjeta nueva: Requiere amount, first6, otp, card_number, cvv, expiry
+        
+        COMPORTAMIENTO:
+        - Busca tarjetas registradas por los primeros 6 dígitos
+        - Si encuentra la tarjeta: Procesa el pago directamente
+        - Si NO encuentra la tarjeta: Valida que se envíen los datos completos
+        - Evita duplicados automáticamente
         """
         data = api.payload
         amount = float(data.get("amount", 0))
         otp = data.get("otp")
         first6 = data.get("first6")
-        full_card = data.get("card_number").replace(" ", "")
+        
+        # Campos opcionales para tarjetas nuevas
+        full_card = data.get("card_number", "").replace(" ", "") if data.get("card_number") else None
         cvv = data.get("cvv")
         expiry = data.get("expiry")
 
@@ -749,35 +757,84 @@ class PayCreditBalance(Resource):
         current_user = g.user.get('username', 'unknown') if hasattr(g, 'user') and g.user else 'unknown'
         user_id = g.user['id']
 
+        # Validaciones básicas
         if amount <= 0:
-            registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | Monto inválido: {amount} | respuesta: 400", 400)
+            registrar_warning(ip_remota, current_user, f"POST /bank/pay-credit-balance | Monto inválido: {amount}", 400)
             api.abort(400, "Amount must be greater than zero")
 
-        if not validar_tarjeta_luhn(full_card):
-            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta inválida | respuesta: 400", 400)
-            api.abort(400, "Número de tarjeta inválido")
-
-        if not full_card.startswith(first6):
-            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Prefijo de tarjeta no coincide | respuesta: 400", 400)
-            api.abort(400, "Los primeros 6 dígitos no coinciden con la tarjeta")
-
         if not verificar_otp(user_id, otp):
-            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | OTP inválido | respuesta: 401", 401)
+            registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | OTP inválido", 401)
             api.abort(401, "OTP inválido o expirado")
 
         conn = get_connection()
         cur = conn.cursor()
 
         try:
-            # Verificar si tarjeta ya está registrada
-            tarjeta_cifrada = cifrar_dato(full_card)
-            cur.execute("""
-                SELECT id FROM bank.secure_cards
-                WHERE user_id = %s AND card_number = %s
-            """, (user_id, tarjeta_cifrada))
-            es_tarjeta_interna = cur.fetchone() is not None
+            # PASO 1: Buscar tarjeta registrada por los primeros 6 dígitos
+            tarjeta_encontrada = None
+            tarjeta_cifrada_encontrada = None
+            es_tarjeta_interna = False
 
-            # Obtener saldo
+            # Buscar en tarjetas internas (secure_cards)
+            cur.execute("SELECT card_number FROM bank.secure_cards WHERE user_id = %s", (user_id,))
+            for row in cur.fetchall():
+                card = descifrar_dato(row[0])
+                if card.startswith(first6):
+                    tarjeta_encontrada = card
+                    tarjeta_cifrada_encontrada = row[0]
+                    es_tarjeta_interna = True
+                    break
+
+            # Si no se encuentra en internas, buscar en externas (stored_cards)
+            if not tarjeta_encontrada:
+                cur.execute("SELECT encrypted_card_number FROM bank.stored_cards WHERE user_id = %s", (user_id,))
+                for row in cur.fetchall():
+                    card = descifrar_dato(row[0])
+                    if card.startswith(first6):
+                        tarjeta_encontrada = card
+                        tarjeta_cifrada_encontrada = row[0]
+                        es_tarjeta_interna = False
+                        break
+
+            # PASO 2: Procesar según si la tarjeta existe o no
+            if tarjeta_encontrada:
+                # CASO A: Tarjeta YA registrada - usar directamente
+                registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | Usando tarjeta registrada {first6}******", 200)
+                tarjeta_a_usar = tarjeta_encontrada
+                tarjeta_cifrada_a_usar = tarjeta_cifrada_encontrada
+                
+            else:
+                # CASO B: Tarjeta NUEVA - validar datos completos
+                if not all([full_card, cvv, expiry]):
+                    registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta nueva requiere datos completos", 400)
+                    api.abort(400, "Para tarjetas nuevas se requiere: card_number, cvv, expiry")
+
+                if not validar_tarjeta_luhn(full_card):
+                    registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta nueva inválida", 400)
+                    api.abort(400, "Número de tarjeta inválido")
+
+                if not full_card.startswith(first6):
+                    registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Prefijo no coincide con tarjeta nueva", 400)
+                    api.abort(400, "Los primeros 6 dígitos no coinciden con la tarjeta")
+
+                # Verificar que no exista ya esta tarjeta (evitar duplicados)
+                tarjeta_cifrada_nueva = cifrar_dato(full_card)
+                cur.execute("""
+                    SELECT id FROM bank.secure_cards WHERE user_id = %s AND card_number = %s
+                    UNION
+                    SELECT id FROM bank.stored_cards WHERE user_id = %s AND encrypted_card_number = %s
+                """, (user_id, tarjeta_cifrada_nueva, user_id, tarjeta_cifrada_nueva))
+                
+                if cur.fetchone():
+                    registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Tarjeta ya registrada", 409)
+                    api.abort(409, "Esta tarjeta ya está registrada. Use solo los primeros 6 dígitos.")
+
+                registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | Registrando nueva tarjeta {first6}******", 200)
+                tarjeta_a_usar = full_card
+                tarjeta_cifrada_a_usar = tarjeta_cifrada_nueva
+                es_tarjeta_interna = False
+
+            # PASO 3: Validar fondos y deuda
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
             cuenta = cur.fetchone()
             if not cuenta:
@@ -787,7 +844,6 @@ class PayCreditBalance(Resource):
                 registrar_warning(ip_remota, current_user, "POST /bank/pay-credit-balance | Fondos insuficientes", 400)
                 return {"message": "Fondos insuficientes"}, 400
 
-            # Obtener deuda
             cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
             deuda = cur.fetchone()
             if not deuda:
@@ -796,46 +852,48 @@ class PayCreditBalance(Resource):
 
             payment = min(amount, float(deuda[0]))
 
-            # Realizar descuento
+            # PASO 4: Realizar transacción
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
 
-            # Registrar tarjeta externa si es nueva
-            if not es_tarjeta_interna:
-                masked_card = f"{full_card[:6]}******{full_card[-4:]}"
-                cur.execute("SELECT id FROM bank.stored_cards WHERE user_id = %s AND encrypted_card_number = %s", (user_id, tarjeta_cifrada))
-                if not cur.fetchone():
-                    cur.execute("""
-                        INSERT INTO bank.stored_cards (
-                            user_id, masked_card, encrypted_card_number,
-                            encrypted_expiry, encrypted_cvv
-                        ) VALUES (%s, %s, %s, %s, %s)
-                    """, (
-                        user_id,
-                        masked_card,
-                        tarjeta_cifrada,
-                        cifrar_dato(expiry),
-                        cifrar_dato(cvv)
-                    ))
+            # PASO 5: Registrar tarjeta nueva si corresponde
+            if not tarjeta_encontrada and not es_tarjeta_interna:
+                masked_card = f"{tarjeta_a_usar[:6]}******{tarjeta_a_usar[-4:]}"
+                cur.execute("""
+                    INSERT INTO bank.stored_cards (
+                        user_id, masked_card, encrypted_card_number,
+                        encrypted_expiry, encrypted_cvv
+                    ) VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    user_id,
+                    masked_card,
+                    tarjeta_cifrada_a_usar,
+                    cifrar_dato(expiry),
+                    cifrar_dato(cvv)
+                ))
 
-            # Obtener nuevos saldos
+            # PASO 6: Obtener nuevos saldos
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
             nuevo_saldo = float(cur.fetchone()[0])
             cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
             nueva_deuda = float(cur.fetchone()[0])
 
             conn.commit()
-            registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | Pago exitoso de ${payment}", 200)
+            
+            status_tarjeta = "registrada" if tarjeta_encontrada else "nueva registrada"
+            registrar_info(ip_remota, current_user, f"POST /bank/pay-credit-balance | Pago exitoso ${payment} con tarjeta {status_tarjeta}", 200)
 
             return {
-                "message": "Pago exitoso de deuda con tarjeta",
+                "message": f"Pago exitoso con tarjeta {status_tarjeta}",
+                "card_status": status_tarjeta,
+                "amount_paid": payment,
                 "account_balance": nuevo_saldo,
                 "credit_card_debt": nueva_deuda
             }, 200
 
         except Exception as e:
             conn.rollback()
-            registrar_error(ip_remota, current_user, f"POST /bank/pay-credit-balance | Error inesperado: {str(e)}", 500)
+            registrar_error(ip_remota, current_user, f"POST /bank/pay-credit-balance | Error: {str(e)}", 500)
             return {"message": f"Error durante la operación: {str(e)}"}, 500
 
         finally:
